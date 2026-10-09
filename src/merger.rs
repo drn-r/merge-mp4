@@ -43,6 +43,8 @@ pub fn merge(files: &[PathBuf], output: &Path, overwrite: bool) -> Result<(), Bo
     }
     let mut movie = inputs[0].moov.clone();
     let mut offsets = vec![Vec::new(); movie.traks.len()];
+    // 只保留首个片段的初始偏移，整条轨道用单条 edit list，兼容 Windows 播放器/缩略图。
+    let initial_edit_offsets: Vec<i64> = movie.traks.iter().map(initial_edit_offset).collect();
     for track in &mut movie.traks {
         clear_track(track);
     }
@@ -114,7 +116,7 @@ pub fn merge(files: &[PathBuf], output: &Path, overwrite: bool) -> Result<(), Bo
     destination.seek(SeekFrom::Start(media_start + 8))?;
     destination.write_all(&(media_end - media_start).to_be_bytes())?;
     destination.seek(SeekFrom::Start(media_end))?;
-    for track in &mut movie.traks {
+    for (index, track) in movie.traks.iter_mut().enumerate() {
         let composition = track.mdia.minf.stbl.ctts.as_mut().unwrap();
         let signed = composition
             .entries
@@ -130,6 +132,14 @@ pub fn merge(files: &[PathBuf], output: &Path, overwrite: bool) -> Result<(), Bo
             return Err(invalid("PTS 偏移超过 MP4 表的取值范围").into());
         }
         composition.header.version = u8::from(signed);
+        let segment_duration = track.tkhd.duration;
+        let media_time = initial_edit_offsets[index].min(track.mdia.mdhd.duration as i64);
+        track.edts.as_mut().unwrap().elst.as_mut().unwrap().entries = vec![ElstEntry {
+            segment_duration,
+            media_time,
+            media_rate_integer: 1,
+            media_rate_fraction: 0,
+        }];
     }
     let mut metadata = Vec::new();
     movie.mux(&mut metadata)?;
@@ -443,6 +453,16 @@ fn validate_input(input: &Input) -> io::Result<()> {
     Ok(())
 }
 
+fn initial_edit_offset(track: &Trak) -> i64 {
+    track
+        .edts
+        .as_ref()
+        .and_then(|edits| edits.elst.as_ref())
+        .and_then(|elst| elst.entries.iter().find(|entry| entry.media_time >= 0))
+        .map(|entry| entry.media_time)
+        .unwrap_or(0)
+}
+
 fn clear_track(track: &mut Trak) {
     track.tkhd.duration = 0;
     track.tkhd.header.version = 1;
@@ -598,54 +618,6 @@ fn append_track(
         (None, None) => {}
         _ => return Err(invalid("样本依赖表配置不一致")),
     }
-    let mut edits = source
-        .edts
-        .as_ref()
-        .and_then(|edits| edits.elst.as_ref())
-        .map(|edits| edits.entries.clone())
-        .unwrap_or_else(|| {
-            vec![ElstEntry {
-                segment_duration: source.tkhd.duration,
-                media_time: 0,
-                media_rate_integer: 1,
-                media_rate_fraction: 0,
-            }]
-        });
-    let mut edit_duration = 0u64;
-    for edit in &mut edits {
-        if edit.media_rate_integer != 1 || edit.media_rate_fraction != 0 || edit.media_time < -1 {
-            return Err(invalid("不支持变速编辑列表"));
-        }
-        edit_duration = edit_duration
-            .checked_add(edit.segment_duration)
-            .ok_or_else(|| invalid("编辑列表时长溢出"))?;
-        if edit.media_time >= 0 {
-            edit.media_time = edit
-                .media_time
-                .checked_add(i64::try_from(media_start).map_err(|_| invalid("时间轴溢出"))?)
-                .ok_or_else(|| invalid("时间轴溢出"))?;
-        }
-    }
-    if edit_duration > segment_duration {
-        return Err(invalid("轨道编辑时长超过片段时长"));
-    }
-    if edit_duration < segment_duration {
-        edits.push(ElstEntry {
-            segment_duration: segment_duration - edit_duration,
-            media_time: -1,
-            media_rate_integer: 1,
-            media_rate_fraction: 0,
-        });
-    }
-    target
-        .edts
-        .as_mut()
-        .unwrap()
-        .elst
-        .as_mut()
-        .unwrap()
-        .entries
-        .extend(edits);
     let duration = source_table
         .stts
         .entries
@@ -805,6 +777,43 @@ mod tests {
     }
 
     #[test]
+    fn single_edit_list_preserves_initial_offset() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let first = directory.path().join("1.mp4");
+        let second = directory.path().join("2.mp4");
+        let output = directory.path().join("merged.mp4");
+        for path in [&first, &second] {
+            fixture(path)?;
+            let mut input = read_input(path)?;
+            input.moov.traks[0].mdia.minf.stbl.stco.entries = vec![(input.ftyp.size() + 8) as u32];
+            input.moov.traks[0].edts = Some(Edts::new(Some(Elst::new(vec![ElstEntry {
+                segment_duration: 20,
+                media_time: 5,
+                media_rate_integer: 1,
+                media_rate_fraction: 0,
+            }]))));
+            let mut writer = File::create(path)?;
+            input.ftyp.mux(&mut writer)?;
+            write_box(&mut writer, *b"mdat", &[1, 2, 3, 4, 5])?;
+            input.moov.mux(&mut writer)?;
+        }
+        merge(&[first, second], &output, false)?;
+        let merged = read_input(&output)?;
+        let edits = &merged.moov.traks[0]
+            .edts
+            .as_ref()
+            .unwrap()
+            .elst
+            .as_ref()
+            .unwrap()
+            .entries;
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].media_time, 5);
+        assert_eq!(edits[0].segment_duration, 40);
+        Ok(())
+    }
+
+    #[test]
     fn offsets_round_trip_above_four_gib() -> io::Result<()> {
         let expected = vec![vec![32, u64::from(u32::MAX) + 100]];
         let mut placeholder = Vec::new();
@@ -839,10 +848,9 @@ mod tests {
         assert_eq!(sample_count(&track.mdia.minf.stbl)?, 4);
         assert_eq!(track.mdia.minf.stbl.stsd.entries.len(), 1);
         let edits = &track.edts.as_ref().unwrap().elst.as_ref().unwrap().entries;
-        assert_eq!(
-            edits.iter().map(|edit| edit.media_time).collect::<Vec<_>>(),
-            vec![0, 20]
-        );
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].media_time, 0);
+        assert_eq!(edits[0].segment_duration, 40);
         let mut reader = File::open(output)?;
         reader.seek(SeekFrom::Start(input.media[0].start))?;
         let mut payload = vec![0; 10];
