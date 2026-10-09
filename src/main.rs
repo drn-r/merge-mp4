@@ -46,11 +46,23 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    let mut overwrite = false;
+    if output.exists() {
+        if !confirm(&format!(
+            "\n输出文件已存在: {}\n覆盖？ [Y/n] ",
+            output.display()
+        ))? {
+            println!("已取消。");
+            return Ok(());
+        }
+        overwrite = true;
+    }
+
     if cli.output.is_none() {
         std::fs::create_dir_all(cli.directory.join("output"))?;
     }
 
-    merge(&files, &output)?;
+    merge(&files, &output, overwrite)?;
     println!("\n完成！已输出: {}", output.display());
     Ok(())
 }

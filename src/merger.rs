@@ -27,11 +27,11 @@ struct Input {
     offsets: Vec<Vec<u64>>,
 }
 
-pub fn merge(files: &[PathBuf], output: &Path) -> Result<(), Box<dyn Error>> {
+pub fn merge(files: &[PathBuf], output: &Path, overwrite: bool) -> Result<(), Box<dyn Error>> {
     if files.is_empty() {
         return Err("没有可合并的输入文件".into());
     }
-    if output.exists() {
+    if output.exists() && !overwrite {
         return Err(format!("输出文件已存在，不会覆盖: {}", output.display()).into());
     }
     let mut inputs = Vec::new();
@@ -141,7 +141,11 @@ pub fn merge(files: &[PathBuf], output: &Path) -> Result<(), Box<dyn Error>> {
     destination.write_all(&metadata)?;
     destination.flush()?;
     destination.as_file().sync_all()?;
-    destination.persist_noclobber(output)?;
+    if overwrite {
+        destination.persist(output)?;
+    } else {
+        destination.persist_noclobber(output)?;
+    }
     Ok(())
 }
 
@@ -826,7 +830,7 @@ mod tests {
         let output = directory.path().join("merged.mp4");
         fixture(&first)?;
         fixture(&second)?;
-        merge(&[first, second], &output)?;
+        merge(&[first, second], &output, false)?;
         let input = read_input(&output)?;
         validate_input(&input)?;
         let track = &input.moov.traks[0];
@@ -902,7 +906,7 @@ mod tests {
         let output = directory.path().join("merged.mp4");
         fixture(&first)?;
         std::fs::write(&broken, b"broken")?;
-        assert!(merge(&[first, broken], &output).is_err());
+        assert!(merge(&[first, broken], &output, false).is_err());
         assert!(!output.exists());
         assert_eq!(std::fs::read_dir(directory.path())?.count(), 2);
         Ok(())
@@ -915,8 +919,22 @@ mod tests {
         let output = directory.path().join("merged.mp4");
         fixture(&input)?;
         std::fs::write(&output, b"existing")?;
-        assert!(merge(&[input], &output).is_err());
+        assert!(merge(&[input], &output, false).is_err());
         assert_eq!(std::fs::read(output)?, b"existing");
+        Ok(())
+    }
+
+    #[test]
+    fn existing_output_is_overwritten_when_allowed() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let input = directory.path().join("input.mp4");
+        let output = directory.path().join("merged.mp4");
+        fixture(&input)?;
+        std::fs::write(&output, b"existing")?;
+        merge(std::slice::from_ref(&input), &output, true)?;
+        let merged = read_input(&output)?;
+        validate_input(&merged)?;
+        assert_ne!(std::fs::read(output)?, b"existing");
         Ok(())
     }
 
@@ -936,7 +954,7 @@ mod tests {
         write_box(&mut writer, *b"mdat", &[1, 2, 3, 4, 5])?;
         input.moov.mux(&mut writer)?;
         drop(writer);
-        assert!(merge(&[first, second], &output).is_err());
+        assert!(merge(&[first, second], &output, false).is_err());
         assert!(!output.exists());
         assert_eq!(std::fs::read_dir(directory.path())?.count(), 2);
         Ok(())
