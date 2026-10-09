@@ -60,6 +60,8 @@ pub fn merge(files: &[PathBuf], output: &Path, overwrite: bool) -> Result<(), Bo
         clear_track(track);
         track.mdia.mdhd.timescale = target_timescales[i];
     }
+    // 以视频轨道的每段展示时长为对齐基准，让音频对齐到视频边界。
+    let video_track = movie.traks.iter().position(is_video_track);
     movie.mvhd.duration = 0;
     movie.mvhd.header.version = 1;
     movie.unknown.clear();
@@ -204,31 +206,57 @@ pub fn merge(files: &[PathBuf], output: &Path, overwrite: bool) -> Result<(), Bo
             return Err(invalid("PTS 偏移超过 MP4 表的取值范围").into());
         }
         composition.header.version = u8::from(signed);
-        // 按段拼接 edit list：连续段合并为一条（如视频），有 priming 裁剪的段保留独立条目（如音频）。
-        let mut entries: Vec<ElstEntry> = Vec::new();
-        let mut media_cursor = 0u64;
-        let mut prev_media_end = 0u64;
-        let mut total = 0u64;
-        for &(presentation, priming, media) in &edit_plans[index] {
-            let media_time = media_cursor as i64 + priming;
-            total = total
-                .checked_add(presentation)
-                .ok_or_else(|| invalid("轨道总时长溢出"))?;
-            if let Some(last) = entries.last_mut()
-                && media_time as u64 == prev_media_end
+        // 视频用单条连续 edit；音频逐段对齐到视频时隙：短则补静音、长则截断，避免累积漂移。
+        let entries: Vec<ElstEntry> = if Some(index) == video_track {
+            let total = edit_plans[index].iter().map(|plan| plan.0).sum();
+            let media_time = edit_plans[index].first().map(|plan| plan.1).unwrap_or(0);
+            vec![ElstEntry {
+                segment_duration: total,
+                media_time,
+                media_rate_integer: 1,
+                media_rate_fraction: 0,
+            }]
+        } else {
+            let mut entries: Vec<ElstEntry> = Vec::new();
+            let mut media_cursor = 0u64;
+            let mut prev_media_end = 0u64;
+            for (seg_index, &(segment_presentation, priming, media)) in
+                edit_plans[index].iter().enumerate()
             {
-                last.segment_duration += presentation;
-            } else {
-                entries.push(ElstEntry {
-                    segment_duration: presentation,
-                    media_time,
-                    media_rate_integer: 1,
-                    media_rate_fraction: 0,
-                });
+                // 以视频该段展示时长为时隙，对齐音画边界。
+                let slot = match video_track {
+                    Some(vi) => edit_plans[vi][seg_index].0,
+                    None => segment_presentation,
+                };
+                let present = segment_presentation.min(slot);
+                let media_time = media_cursor as i64 + priming;
+                if let Some(last) = entries.last_mut()
+                    && last.media_time >= 0
+                    && media_time as u64 == prev_media_end
+                {
+                    last.segment_duration += present;
+                } else {
+                    entries.push(ElstEntry {
+                        segment_duration: present,
+                        media_time,
+                        media_rate_integer: 1,
+                        media_rate_fraction: 0,
+                    });
+                }
+                if present < slot {
+                    entries.push(ElstEntry {
+                        segment_duration: slot - present,
+                        media_time: -1,
+                        media_rate_integer: 1,
+                        media_rate_fraction: 0,
+                    });
+                }
+                media_cursor += media;
+                prev_media_end = media_cursor;
             }
-            media_cursor += media;
-            prev_media_end = media_cursor;
-        }
+            entries
+        };
+        let total: u64 = entries.iter().map(|entry| entry.segment_duration).sum();
         let elst = track.edts.as_mut().unwrap().elst.as_mut().unwrap();
         elst.header.version = 1;
         elst.entries = entries;
@@ -1111,6 +1139,8 @@ mod tests {
         for path in [&first, &second] {
             fixture(path)?;
             let mut input = read_input(path)?;
+            // 改成音频轨（无视频轨）以走逐段 priming 裁剪路径。
+            input.moov.traks[0].mdia.hdlr.handler_type = HandlerType::Soun;
             input.moov.traks[0].mdia.minf.stbl.stco.entries = vec![(input.ftyp.size() + 8) as u32];
             input.moov.traks[0].edts = Some(Edts::new(Some(Elst::new(vec![ElstEntry {
                 segment_duration: 20,
