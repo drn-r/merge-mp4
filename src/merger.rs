@@ -54,16 +54,8 @@ pub fn merge(files: &[PathBuf], output: &Path, overwrite: bool) -> Result<(), Bo
             target_timescales[i] = lcm(target_timescales[i], track.mdia.mdhd.timescale)?;
         }
     }
-    // 只保留首个片段的初始偏移，整条轨道用单条 edit list，兼容 Windows 播放器/缩略图。
-    let initial_edit_offsets: Vec<i64> = movie
-        .traks
-        .iter()
-        .enumerate()
-        .map(|(i, track)| {
-            let factor = i64::from(target_timescales[i] / track.mdia.mdhd.timescale);
-            initial_edit_offset(track) * factor
-        })
-        .collect();
+    // 逐段重建 edit list：每段按源 edit list 裁剪 priming（如音频编码器延迟），避免累积不同步。
+    let mut edit_plans: Vec<Vec<(u64, i64, u64)>> = vec![Vec::new(); track_count];
     for (i, track) in movie.traks.iter_mut().enumerate() {
         clear_track(track);
         track.mdia.mdhd.timescale = target_timescales[i];
@@ -163,6 +155,8 @@ pub fn merge(files: &[PathBuf], output: &Path, overwrite: bool) -> Result<(), Bo
                 .collect::<io::Result<Vec<_>>>()?;
             let mut source = source.clone();
             rescale_timing(&mut source, target_timescales[track_index])?;
+            let (priming, presentation) = segment_edit(&source);
+            edit_plans[track_index].push((presentation, priming, media_duration(&source)));
             let prepend = if Some(track_index) == video_index {
                 inject_len as u32
             } else {
@@ -210,14 +204,35 @@ pub fn merge(files: &[PathBuf], output: &Path, overwrite: bool) -> Result<(), Bo
             return Err(invalid("PTS 偏移超过 MP4 表的取值范围").into());
         }
         composition.header.version = u8::from(signed);
-        let segment_duration = track.tkhd.duration;
-        let media_time = initial_edit_offsets[index].min(track.mdia.mdhd.duration as i64);
-        track.edts.as_mut().unwrap().elst.as_mut().unwrap().entries = vec![ElstEntry {
-            segment_duration,
-            media_time,
-            media_rate_integer: 1,
-            media_rate_fraction: 0,
-        }];
+        // 按段拼接 edit list：连续段合并为一条（如视频），有 priming 裁剪的段保留独立条目（如音频）。
+        let mut entries: Vec<ElstEntry> = Vec::new();
+        let mut media_cursor = 0u64;
+        let mut prev_media_end = 0u64;
+        let mut total = 0u64;
+        for &(presentation, priming, media) in &edit_plans[index] {
+            let media_time = media_cursor as i64 + priming;
+            total = total
+                .checked_add(presentation)
+                .ok_or_else(|| invalid("轨道总时长溢出"))?;
+            if let Some(last) = entries.last_mut()
+                && media_time as u64 == prev_media_end
+            {
+                last.segment_duration += presentation;
+            } else {
+                entries.push(ElstEntry {
+                    segment_duration: presentation,
+                    media_time,
+                    media_rate_integer: 1,
+                    media_rate_fraction: 0,
+                });
+            }
+            media_cursor += media;
+            prev_media_end = media_cursor;
+        }
+        let elst = track.edts.as_mut().unwrap().elst.as_mut().unwrap();
+        elst.header.version = 1;
+        elst.entries = entries;
+        track.tkhd.duration = total;
     }
     let mut metadata = Vec::new();
     movie.mux(&mut metadata)?;
@@ -566,19 +581,58 @@ fn rescale_timing(track: &mut Trak, target_timescale: u32) -> io::Result<()> {
                     .ok_or_else(|| invalid("重定时后 PTS 偏移溢出"))?;
             }
         }
+        if let Some(elst) = track.edts.as_mut().and_then(|edits| edits.elst.as_mut()) {
+            for entry in &mut elst.entries {
+                if entry.media_time >= 0 {
+                    entry.media_time = entry
+                        .media_time
+                        .checked_mul(factor as i64)
+                        .ok_or_else(|| invalid("重定时后编辑偏移溢出"))?;
+                }
+            }
+        }
     }
     track.mdia.mdhd.timescale = target_timescale;
     Ok(())
 }
 
-fn initial_edit_offset(track: &Trak) -> i64 {
+fn media_duration(track: &Trak) -> u64 {
     track
+        .mdia
+        .minf
+        .stbl
+        .stts
+        .entries
+        .iter()
+        .map(|entry| u64::from(entry.sample_count) * u64::from(entry.sample_delta))
+        .sum()
+}
+
+// 返回该片段的 (priming 裁剪量, 展示时长)，均来自源 edit list。
+fn segment_edit(track: &Trak) -> (i64, u64) {
+    match track
         .edts
         .as_ref()
         .and_then(|edits| edits.elst.as_ref())
-        .and_then(|elst| elst.entries.iter().find(|entry| entry.media_time >= 0))
-        .map(|entry| entry.media_time)
-        .unwrap_or(0)
+        .filter(|elst| !elst.entries.is_empty())
+    {
+        Some(elst) => {
+            let priming = elst
+                .entries
+                .iter()
+                .find(|entry| entry.media_time >= 0)
+                .map(|entry| entry.media_time)
+                .unwrap_or(0);
+            let presentation = elst
+                .entries
+                .iter()
+                .filter(|entry| entry.media_time >= 0)
+                .map(|entry| entry.segment_duration)
+                .sum();
+            (priming, presentation)
+        }
+        None => (0, track.tkhd.duration),
+    }
 }
 
 fn clear_track(track: &mut Trak) {
@@ -1049,7 +1103,7 @@ mod tests {
     }
 
     #[test]
-    fn single_edit_list_preserves_initial_offset() -> Result<(), Box<dyn Error>> {
+    fn per_segment_priming_is_trimmed() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
         let first = directory.path().join("1.mp4");
         let second = directory.path().join("2.mp4");
@@ -1071,6 +1125,28 @@ mod tests {
         }
         merge(&[first, second], &output, false)?;
         let merged = read_input(&output)?;
+        let track = &merged.moov.traks[0];
+        let edits = &track.edts.as_ref().unwrap().elst.as_ref().unwrap().entries;
+        // 每段 priming(5) 独立裁剪：媒体时长 20，第二段从 20+5 开始。
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0].media_time, 5);
+        assert_eq!(edits[1].media_time, 25);
+        assert!(edits.iter().all(|edit| edit.segment_duration == 20));
+        assert_eq!(track.tkhd.duration, 40);
+        Ok(())
+    }
+
+    #[test]
+    fn contiguous_segments_collapse_to_one_edit() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let first = directory.path().join("1.mp4");
+        let second = directory.path().join("2.mp4");
+        let output = directory.path().join("merged.mp4");
+        fixture(&first)?;
+        fixture(&second)?;
+        merge(&[first, second], &output, false)?;
+        let merged = read_input(&output)?;
+        // 源无 priming（fixture 无 edts），两段连续应合并为单条 edit。
         let edits = &merged.moov.traks[0]
             .edts
             .as_ref()
@@ -1080,7 +1156,7 @@ mod tests {
             .unwrap()
             .entries;
         assert_eq!(edits.len(), 1);
-        assert_eq!(edits[0].media_time, 5);
+        assert_eq!(edits[0].media_time, 0);
         assert_eq!(edits[0].segment_duration, 40);
         Ok(())
     }
