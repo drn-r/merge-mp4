@@ -28,7 +28,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     let output = cli
         .output
         .clone()
-        .unwrap_or_else(|| cli.directory.join("merged.mp4"));
+        .unwrap_or_else(|| cli.directory.join("output").join("merged.mp4"));
 
     let files = scan_mp4_files(&cli.directory, &output)?;
     if files.is_empty() {
@@ -44,6 +44,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     if !confirm("\n开始合并？ [Y/n] ")? {
         println!("已取消。");
         return Ok(());
+    }
+
+    if cli.output.is_none() {
+        std::fs::create_dir_all(cli.directory.join("output"))?;
     }
 
     merge(&files, &output)?;

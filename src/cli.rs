@@ -9,7 +9,7 @@ pub struct Cli {
     /// 包含 mp4 文件的目录（必填）
     pub directory: PathBuf,
 
-    /// 输出文件路径（默认在源目录生成 merged.mp4）
+    /// 输出文件路径（默认在源目录的 output 子目录生成 merged.mp4）
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
 
