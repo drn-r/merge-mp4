@@ -114,10 +114,30 @@ pub fn merge(files: &[PathBuf], output: &Path) -> Result<(), Box<dyn Error>> {
     destination.seek(SeekFrom::Start(media_start + 8))?;
     destination.write_all(&(media_end - media_start).to_be_bytes())?;
     destination.seek(SeekFrom::Start(media_end))?;
+    for track in &mut movie.traks {
+        let composition = track.mdia.minf.stbl.ctts.as_mut().unwrap();
+        let signed = composition
+            .entries
+            .iter()
+            .any(|entry| entry.sample_offset < 0);
+        if composition.entries.iter().any(|entry| {
+            if signed {
+                i32::try_from(entry.sample_offset).is_err()
+            } else {
+                u32::try_from(entry.sample_offset).is_err()
+            }
+        }) {
+            return Err(invalid("PTS 偏移超过 MP4 表的取值范围").into());
+        }
+        composition.header.version = u8::from(signed);
+    }
     let mut metadata = Vec::new();
     movie.mux(&mut metadata)?;
     let mut table_index = 0;
     let metadata = rewrite_offsets(Bytes::from(metadata), &mut offsets, &mut table_index, true)?;
+    if table_index != offsets.len() {
+        return Err(invalid("输出轨道块偏移数量不一致").into());
+    }
     destination.write_all(&metadata)?;
     destination.flush()?;
     destination.as_file().sync_all()?;
@@ -341,30 +361,29 @@ fn validate_input(input: &Input) -> io::Result<()> {
         if sizes.sample_size == 0 && sizes.samples.len() != count as usize {
             return Err(invalid("样本大小表和时间表数量不一致"));
         }
-        if let Some(ctts) = &table.ctts {
-            if ctts
+        if let Some(ctts) = &table.ctts
+            && ctts
                 .entries
                 .iter()
                 .map(|entry| u64::from(entry.sample_count))
                 .sum::<u64>()
                 != u64::from(count)
-            {
-                return Err(invalid("PTS 偏移表样本数量不一致"));
-            }
+        {
+            return Err(invalid("PTS 偏移表样本数量不一致"));
         }
-        if let Some(dependencies) = &table.sdtp {
-            if dependencies.entries.len() != count as usize {
-                return Err(invalid("样本依赖表数量不一致"));
-            }
+        if let Some(dependencies) = &table.sdtp
+            && dependencies.entries.len() != count as usize
+        {
+            return Err(invalid("样本依赖表数量不一致"));
         }
         if table.stsc.entries.first().map(|entry| entry.first_chunk) != Some(1) {
             return Err(invalid("样本块映射必须从块 1 开始"));
         }
         for group in &table.unknown {
-            if let DynBox::Unknown((header, payload)) = group {
-                if header.box_type == *b"sbgX" {
-                    group_prefix(payload)?;
-                }
+            if let DynBox::Unknown((header, payload)) = group
+                && header.box_type == *b"sbgX"
+            {
+                group_prefix(payload)?;
             }
         }
         let mut sample_index = 0usize;
@@ -453,13 +472,13 @@ fn clear_track(track: &mut Trak) {
         dependencies.entries.clear();
     }
     for entry in &mut table.unknown {
-        if let DynBox::Unknown((header, payload)) = entry {
-            if header.box_type == *b"sbgX" {
-                let prefix = if payload[0] == 1 { 12 } else { 8 };
-                let mut empty = payload[..prefix].to_vec();
-                empty.extend_from_slice(&0u32.to_be_bytes());
-                *payload = Bytes::from(empty);
-            }
+        if let DynBox::Unknown((header, payload)) = entry
+            && header.box_type == *b"sbgX"
+        {
+            let prefix = if payload[0] == 1 { 12 } else { 8 };
+            let mut empty = payload[..prefix].to_vec();
+            empty.extend_from_slice(&0u32.to_be_bytes());
+            *payload = Bytes::from(empty);
         }
     }
 }
@@ -496,12 +515,12 @@ fn append_track(
         {
             return Err(invalid("片段编码格式不一致"));
         }
-        if let DynBox::Mp4a(existing) = existing {
-            if source_table.stsd.entries.iter().any(|entry| {
+        if let DynBox::Mp4a(existing) = existing
+            && source_table.stsd.entries.iter().any(|entry| {
                 !matches!(entry, DynBox::Mp4a(source) if source.audio_sample_entry == existing.audio_sample_entry)
-            }) {
-                return Err(invalid("音频采样率或声道配置不一致"));
-            }
+            })
+        {
+            return Err(invalid("音频采样率或声道配置不一致"));
         }
     }
     let sample_start = sample_count(target_table)?;
@@ -702,7 +721,9 @@ fn append_groups(target: &mut Stbl, source: &Stbl, sample_count: u32) -> io::Res
         let mut combined = target_payload.to_vec();
         combined.extend_from_slice(&source_payload[prefix + 4..]);
         let grouped_count = source_payload[prefix + 4..]
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|entry| u64::from(u32::from_be_bytes(entry[..4].try_into().unwrap())))
             .sum::<u64>();
         if grouped_count > u64::from(sample_count) {
@@ -896,6 +917,28 @@ mod tests {
         std::fs::write(&output, b"existing")?;
         assert!(merge(&[input], &output).is_err());
         assert_eq!(std::fs::read(output)?, b"existing");
+        Ok(())
+    }
+
+    #[test]
+    fn incompatible_track_cleans_up_temporary_output() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let first = directory.path().join("1.mp4");
+        let second = directory.path().join("2.mp4");
+        let output = directory.path().join("merged.mp4");
+        fixture(&first)?;
+        fixture(&second)?;
+        let mut input = read_input(&second)?;
+        input.moov.traks[0].mdia.mdhd.timescale = 2000;
+        input.moov.traks[0].mdia.minf.stbl.stco.entries = vec![(input.ftyp.size() + 8) as u32];
+        let mut writer = File::create(&second)?;
+        input.ftyp.mux(&mut writer)?;
+        write_box(&mut writer, *b"mdat", &[1, 2, 3, 4, 5])?;
+        input.moov.mux(&mut writer)?;
+        drop(writer);
+        assert!(merge(&[first, second], &output).is_err());
+        assert!(!output.exists());
+        assert_eq!(std::fs::read_dir(directory.path())?.count(), 2);
         Ok(())
     }
 }
