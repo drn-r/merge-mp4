@@ -42,11 +42,31 @@ pub fn merge(files: &[PathBuf], output: &Path, overwrite: bool) -> Result<(), Bo
         inputs.push(input);
     }
     let mut movie = inputs[0].moov.clone();
-    let mut offsets = vec![Vec::new(); movie.traks.len()];
+    let track_count = movie.traks.len();
+    let mut offsets = vec![Vec::new(); track_count];
+    // 各轨道统一到所有片段媒体时间基的最小公倍数，重定时精确无损。
+    let mut target_timescales = vec![1u32; track_count];
+    for (path, input) in files.iter().zip(&inputs) {
+        if input.moov.traks.len() != track_count {
+            return Err(format!("{} 的轨道数量与第一个文件不一致", path.display()).into());
+        }
+        for (i, track) in input.moov.traks.iter().enumerate() {
+            target_timescales[i] = lcm(target_timescales[i], track.mdia.mdhd.timescale)?;
+        }
+    }
     // 只保留首个片段的初始偏移，整条轨道用单条 edit list，兼容 Windows 播放器/缩略图。
-    let initial_edit_offsets: Vec<i64> = movie.traks.iter().map(initial_edit_offset).collect();
-    for track in &mut movie.traks {
+    let initial_edit_offsets: Vec<i64> = movie
+        .traks
+        .iter()
+        .enumerate()
+        .map(|(i, track)| {
+            let factor = i64::from(target_timescales[i] / track.mdia.mdhd.timescale);
+            initial_edit_offset(track) * factor
+        })
+        .collect();
+    for (i, track) in movie.traks.iter_mut().enumerate() {
         clear_track(track);
+        track.mdia.mdhd.timescale = target_timescales[i];
     }
     movie.mvhd.duration = 0;
     movie.mvhd.header.version = 1;
@@ -91,9 +111,11 @@ pub fn merge(files: &[PathBuf], output: &Path, overwrite: bool) -> Result<(), Bo
                     Ok(media_locations[index] + offset - input.media[index].start)
                 })
                 .collect::<io::Result<Vec<_>>>()?;
+            let mut source = source.clone();
+            rescale_timing(&mut source, target_timescales[track_index])?;
             append_track(
                 &mut movie.traks[track_index],
-                source,
+                &source,
                 input.moov.mvhd.duration,
                 &mut offsets[track_index],
                 &relocated,
@@ -453,6 +475,46 @@ fn validate_input(input: &Input) -> io::Result<()> {
     Ok(())
 }
 
+fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+fn lcm(a: u32, b: u32) -> io::Result<u32> {
+    let g = gcd(a, b);
+    if g == 0 {
+        return Err(invalid("无效的媒体时间基"));
+    }
+    let value = u64::from(a) / u64::from(g) * u64::from(b);
+    u32::try_from(value)
+        .map_err(|_| invalid("媒体时间基差异过大，无法无损合并（需重新编码统一时间基）"))
+}
+
+// 将轨道时间表缩放到目标时间基（目标为各片段时间基的公倍数，整数倍缩放，无损）。
+fn rescale_timing(track: &mut Trak, target_timescale: u32) -> io::Result<()> {
+    let source_timescale = track.mdia.mdhd.timescale;
+    let factor = u64::from(target_timescale / source_timescale);
+    if factor != 1 {
+        let table = &mut track.mdia.minf.stbl;
+        for entry in &mut table.stts.entries {
+            entry.sample_delta = u32::try_from(u64::from(entry.sample_delta) * factor)
+                .map_err(|_| invalid("重定时后样本间隔溢出"))?;
+        }
+        if let Some(ctts) = &mut table.ctts {
+            for entry in &mut ctts.entries {
+                entry.sample_offset = entry
+                    .sample_offset
+                    .checked_mul(factor as i64)
+                    .ok_or_else(|| invalid("重定时后 PTS 偏移溢出"))?;
+            }
+        }
+    }
+    track.mdia.mdhd.timescale = target_timescale;
+    Ok(())
+}
+
 fn initial_edit_offset(track: &Trak) -> i64 {
     track
         .edts
@@ -514,12 +576,26 @@ fn append_track(
     offsets: &mut Vec<u64>,
     source_offsets: &[u64],
 ) -> io::Result<()> {
-    if target.mdia.hdlr.handler_type != source.mdia.hdlr.handler_type
-        || target.mdia.mdhd.timescale != source.mdia.mdhd.timescale
-        || target.tkhd.width != source.tkhd.width
-        || target.tkhd.height != source.tkhd.height
-    {
-        return Err(invalid("轨道类型、时间基或分辨率不一致"));
+    if target.mdia.hdlr.handler_type != source.mdia.hdlr.handler_type {
+        return Err(invalid(&format!(
+            "轨道类型不一致: {:?} vs {:?}",
+            target.mdia.hdlr.handler_type, source.mdia.hdlr.handler_type
+        )));
+    }
+    if target.mdia.mdhd.timescale != source.mdia.mdhd.timescale {
+        return Err(invalid(&format!(
+            "时间基不一致: {} vs {}",
+            target.mdia.mdhd.timescale, source.mdia.mdhd.timescale
+        )));
+    }
+    if target.tkhd.width != source.tkhd.width || target.tkhd.height != source.tkhd.height {
+        return Err(invalid(&format!(
+            "分辨率不一致: {}x{} vs {}x{}",
+            target.tkhd.width.to_num::<u32>(),
+            target.tkhd.height.to_num::<u32>(),
+            source.tkhd.width.to_num::<u32>(),
+            source.tkhd.height.to_num::<u32>()
+        )));
     }
     let media_start = target.mdia.mdhd.duration;
     let source_table = &source.mdia.minf.stbl;
@@ -814,6 +890,50 @@ mod tests {
     }
 
     #[test]
+    fn different_timescales_are_rescaled() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let first = directory.path().join("1.mp4");
+        let second = directory.path().join("2.mp4");
+        let output = directory.path().join("merged.mp4");
+        fixture(&first)?;
+        fixture(&second)?;
+        let mut input = read_input(&second)?;
+        input.moov.traks[0].mdia.mdhd.timescale = 2000;
+        input.moov.traks[0].mdia.minf.stbl.stts = Stts::new(vec![SttsEntry {
+            sample_count: 2,
+            sample_delta: 20,
+        }]);
+        input.moov.traks[0].mdia.minf.stbl.stco.entries = vec![(input.ftyp.size() + 8) as u32];
+        let mut writer = File::create(&second)?;
+        input.ftyp.mux(&mut writer)?;
+        write_box(&mut writer, *b"mdat", &[1, 2, 3, 4, 5])?;
+        input.moov.mux(&mut writer)?;
+        drop(writer);
+
+        merge(&[first, second], &output, false)?;
+        let merged = read_input(&output)?;
+        let track = &merged.moov.traks[0];
+        assert_eq!(track.mdia.mdhd.timescale, 2000);
+        assert!(
+            track
+                .mdia
+                .minf
+                .stbl
+                .stts
+                .entries
+                .iter()
+                .all(|entry| entry.sample_delta == 20)
+        );
+        assert_eq!(sample_count(&track.mdia.minf.stbl)?, 4);
+        let mut reader = File::open(output)?;
+        reader.seek(SeekFrom::Start(merged.media[0].start))?;
+        let mut payload = vec![0; 10];
+        reader.read_exact(&mut payload)?;
+        assert_eq!(payload, vec![1, 2, 3, 4, 5, 1, 2, 3, 4, 5]);
+        Ok(())
+    }
+
+    #[test]
     fn offsets_round_trip_above_four_gib() -> io::Result<()> {
         let expected = vec![vec![32, u64::from(u32::MAX) + 100]];
         let mut placeholder = Vec::new();
@@ -955,7 +1075,11 @@ mod tests {
         fixture(&first)?;
         fixture(&second)?;
         let mut input = read_input(&second)?;
-        input.moov.traks[0].mdia.mdhd.timescale = 2000;
+        if let DynBox::Unknown((header, _)) =
+            &mut input.moov.traks[0].mdia.minf.stbl.stsd.entries[0]
+        {
+            header.box_type = *b"avc1";
+        }
         input.moov.traks[0].mdia.minf.stbl.stco.entries = vec![(input.ftyp.size() + 8) as u32];
         let mut writer = File::create(&second)?;
         input.ftyp.mux(&mut writer)?;
