@@ -90,13 +90,59 @@ pub fn merge(files: &[PathBuf], output: &Path, overwrite: bool) -> Result<(), Bo
             return Err(format!("{} 的容器时间基或轨道数量不一致", path.display()).into());
         }
         let mut reader = BufReader::new(File::open(path)?);
+        // 为视频轨道的首关键帧准备 in-band 参数集，兼容只按首条 description 配置的 Windows 解码器。
+        let video_index = input.moov.traks.iter().position(is_video_track);
+        let injection = match video_index {
+            Some(vi) => first_keyframe_injection(&input.moov.traks[vi], &input.offsets[vi])?,
+            None => None,
+        };
+        // 源样本若已自带 in-band 参数集则无需再注入，避免重复。
+        let injection = match injection {
+            Some((pos, blob, nal_length_size, is_hevc)) => {
+                reader.seek(SeekFrom::Start(pos))?;
+                let mut head = vec![0u8; nal_length_size as usize + 2];
+                reader.read_exact(&mut head)?;
+                let nal_header = head[nal_length_size as usize];
+                let already_present = if is_hevc {
+                    matches!((nal_header >> 1) & 0x3f, 32..=34)
+                } else {
+                    matches!(nal_header & 0x1f, 7 | 8)
+                };
+                if already_present {
+                    None
+                } else {
+                    Some((pos, blob))
+                }
+            }
+            None => None,
+        };
+        let inject_pos = injection.as_ref().map(|(pos, _)| *pos);
+        let inject_len = injection
+            .as_ref()
+            .map(|(_, blob)| blob.len() as u64)
+            .unwrap_or(0);
+        let inject_range =
+            inject_pos.and_then(|pos| input.media.iter().position(|r| r.contains(&pos)));
         let mut media_locations = Vec::new();
-        for range in &input.media {
+        for (range_idx, range) in input.media.iter().enumerate() {
             media_locations.push(destination.stream_position()?);
             reader.seek(SeekFrom::Start(range.start))?;
-            let length = range.end - range.start;
-            if io::copy(&mut reader.by_ref().take(length), &mut destination)? != length {
-                return Err(format!("{} 的媒体数据不完整", path.display()).into());
+            if Some(range_idx) == inject_range {
+                let pos = inject_pos.unwrap();
+                let head = pos - range.start;
+                if io::copy(&mut reader.by_ref().take(head), &mut destination)? != head {
+                    return Err(format!("{} 的媒体数据不完整", path.display()).into());
+                }
+                destination.write_all(&injection.as_ref().unwrap().1)?;
+                let tail = range.end - pos;
+                if io::copy(&mut reader.by_ref().take(tail), &mut destination)? != tail {
+                    return Err(format!("{} 的媒体数据不完整", path.display()).into());
+                }
+            } else {
+                let length = range.end - range.start;
+                if io::copy(&mut reader.by_ref().take(length), &mut destination)? != length {
+                    return Err(format!("{} 的媒体数据不完整", path.display()).into());
+                }
             }
         }
         for (track_index, source) in input.moov.traks.iter().enumerate() {
@@ -108,17 +154,27 @@ pub fn merge(files: &[PathBuf], output: &Path, overwrite: bool) -> Result<(), Bo
                         .iter()
                         .position(|range| range.contains(offset))
                         .ok_or_else(|| invalid("存在指向 mdat 之外的块偏移"))?;
-                    Ok(media_locations[index] + offset - input.media[index].start)
+                    let mut out = media_locations[index] + offset - input.media[index].start;
+                    if Some(index) == inject_range && inject_pos.is_some_and(|pos| *offset > pos) {
+                        out += inject_len;
+                    }
+                    Ok(out)
                 })
                 .collect::<io::Result<Vec<_>>>()?;
             let mut source = source.clone();
             rescale_timing(&mut source, target_timescales[track_index])?;
+            let prepend = if Some(track_index) == video_index {
+                inject_len as u32
+            } else {
+                0
+            };
             append_track(
                 &mut movie.traks[track_index],
                 &source,
                 input.moov.mvhd.duration,
                 &mut offsets[track_index],
                 &relocated,
+                prepend,
             )
             .map_err(|error| {
                 format!(
@@ -569,12 +625,161 @@ fn clear_track(track: &mut Trak) {
     }
 }
 
+fn is_video_track(track: &Trak) -> bool {
+    track.mdia.hdlr.handler_type.to_bytes() == *b"vide"
+}
+
+fn push_nal(out: &mut Vec<u8>, nal_length_size: u8, nal: &[u8]) {
+    let length = (nal.len() as u32).to_be_bytes();
+    out.extend_from_slice(&length[4 - nal_length_size as usize..]);
+    out.extend_from_slice(nal);
+}
+
+fn avcc_blob(config: &[u8]) -> io::Result<Vec<u8>> {
+    if config.len() < 6 {
+        return Err(invalid("avcC 过短"));
+    }
+    let nal_length_size = (config[4] & 0x03) + 1;
+    let mut out = Vec::new();
+    let mut i = 5;
+    let num_sps = config[i] & 0x1F;
+    i += 1;
+    for _ in 0..num_sps {
+        i = push_sized_nal(&mut out, config, i, nal_length_size)?;
+    }
+    if i >= config.len() {
+        return Err(invalid("avcC 缺少 PPS"));
+    }
+    let num_pps = config[i];
+    i += 1;
+    for _ in 0..num_pps {
+        i = push_sized_nal(&mut out, config, i, nal_length_size)?;
+    }
+    Ok(out)
+}
+
+fn hvcc_blob(config: &[u8]) -> io::Result<Vec<u8>> {
+    if config.len() < 23 {
+        return Err(invalid("hvcC 过短"));
+    }
+    let nal_length_size = (config[21] & 0x03) + 1;
+    let num_arrays = config[22];
+    let mut out = Vec::new();
+    let mut i = 23;
+    for _ in 0..num_arrays {
+        if i + 3 > config.len() {
+            return Err(invalid("hvcC 数组截断"));
+        }
+        let nal_type = config[i] & 0x3F;
+        let count = u16::from_be_bytes([config[i + 1], config[i + 2]]);
+        i += 3;
+        for _ in 0..count {
+            if matches!(nal_type, 32..=34) {
+                i = push_sized_nal(&mut out, config, i, nal_length_size)?;
+            } else {
+                i = skip_sized_nal(config, i)?;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn push_sized_nal(
+    out: &mut Vec<u8>,
+    config: &[u8],
+    offset: usize,
+    nal_length_size: u8,
+) -> io::Result<usize> {
+    if offset + 2 > config.len() {
+        return Err(invalid("参数集 NAL 截断"));
+    }
+    let length = u16::from_be_bytes([config[offset], config[offset + 1]]) as usize;
+    let start = offset + 2;
+    if start + length > config.len() {
+        return Err(invalid("参数集 NAL 截断"));
+    }
+    push_nal(out, nal_length_size, &config[start..start + length]);
+    Ok(start + length)
+}
+
+fn skip_sized_nal(config: &[u8], offset: usize) -> io::Result<usize> {
+    if offset + 2 > config.len() {
+        return Err(invalid("参数集 NAL 截断"));
+    }
+    let length = u16::from_be_bytes([config[offset], config[offset + 1]]) as usize;
+    let start = offset + 2;
+    if start + length > config.len() {
+        return Err(invalid("参数集 NAL 截断"));
+    }
+    Ok(start + length)
+}
+
+// 从视频 sample entry 中取出参数集，返回 (可直接前置的 NAL 字节, NAL 长度前缀字节数, 是否 HEVC)。
+fn video_parameter_blob(entry: &DynBox) -> io::Result<Option<(Vec<u8>, u8, bool)>> {
+    let mut boxed = Vec::new();
+    entry.mux(&mut boxed)?;
+    if boxed.len() < 8 + 78 {
+        return Ok(None);
+    }
+    let (config_name, is_hevc): ([u8; 4], bool) = match &boxed[4..8] {
+        b"avc1" => (*b"avcC", false),
+        b"hvc1" | b"hev1" => (*b"hvcC", true),
+        _ => return Ok(None),
+    };
+    let mut i = 8 + 78;
+    while i + 8 <= boxed.len() {
+        let size = u32::from_be_bytes(boxed[i..i + 4].try_into().unwrap()) as usize;
+        if size < 8 || i + size > boxed.len() {
+            break;
+        }
+        if boxed[i + 4..i + 8] == config_name {
+            let payload = &boxed[i + 8..i + size];
+            let (blob, nal_length_size) = if is_hevc {
+                (hvcc_blob(payload)?, (payload[21] & 0x03) + 1)
+            } else {
+                (avcc_blob(payload)?, (payload[4] & 0x03) + 1)
+            };
+            return Ok(Some((blob, nal_length_size, is_hevc)));
+        }
+        i += size;
+    }
+    Ok(None)
+}
+
+// 定位视频轨道首个关键帧样本的源偏移，并取出要前置的参数集字节。
+fn first_keyframe_injection(
+    track: &Trak,
+    chunk_offsets: &[u64],
+) -> io::Result<Option<(u64, Vec<u8>, u8, bool)>> {
+    let table = &track.mdia.minf.stbl;
+    let Some(entry) = table.stsd.entries.first() else {
+        return Ok(None);
+    };
+    let Some((blob, nal_length_size, is_hevc)) = video_parameter_blob(entry)? else {
+        return Ok(None);
+    };
+    if blob.is_empty() {
+        return Ok(None);
+    }
+    // 仅当首个样本即关键帧时注入，确保参数集落在解码起点之前。
+    if let Some(stss) = &table.stss
+        && stss.entries.first() != Some(&1)
+    {
+        return Ok(None);
+    }
+    let Some(&offset) = chunk_offsets.first() else {
+        return Ok(None);
+    };
+    Ok(Some((offset, blob, nal_length_size, is_hevc)))
+}
+
 fn append_track(
     target: &mut Trak,
     source: &Trak,
     segment_duration: u64,
     offsets: &mut Vec<u64>,
     source_offsets: &[u64],
+    prepend_bytes: u32,
 ) -> io::Result<()> {
     if target.mdia.hdlr.handler_type != source.mdia.hdlr.handler_type {
         return Err(invalid(&format!(
@@ -621,21 +826,17 @@ fn append_track(
         .checked_add(count)
         .ok_or_else(|| invalid("样本总数量溢出"))?;
     let chunk_start = u32::try_from(offsets.len()).map_err(|_| invalid("块数量溢出"))?;
-    let mut descriptions = Vec::new();
-    for entry in &source_table.stsd.entries {
-        let index = match target_table
-            .stsd
-            .entries
-            .iter()
-            .position(|existing| existing == entry)
-        {
-            Some(index) => index,
-            None => {
-                target_table.stsd.entries.push(entry.clone());
-                target_table.stsd.entries.len() - 1
-            }
-        };
-        descriptions.push(u32::try_from(index + 1).map_err(|_| invalid("样本描述数量溢出"))?);
+    // 所有片段统一引用首段的 sample description；参数集差异由每段关键帧的 in-band NAL 承载，
+    // 避免多条 description 让只用第一条配置解码器的 Windows 解码器花屏。
+    if target_table.stsd.entries.is_empty() {
+        target_table.stsd.entries.push(
+            source_table
+                .stsd
+                .entries
+                .first()
+                .cloned()
+                .ok_or_else(|| invalid("缺少样本描述"))?,
+        );
     }
     for entry in &source_table.stsc.entries {
         let mut entry = entry.clone();
@@ -643,9 +844,7 @@ fn append_track(
             .first_chunk
             .checked_add(chunk_start)
             .ok_or_else(|| invalid("块索引溢出"))?;
-        entry.sample_description_index = *descriptions
-            .get(entry.sample_description_index.wrapping_sub(1) as usize)
-            .ok_or_else(|| invalid("无效样本描述索引"))?;
+        entry.sample_description_index = 1;
         target_table.stsc.entries.push(entry);
     }
     offsets.extend_from_slice(source_offsets);
@@ -659,6 +858,12 @@ fn append_track(
         target_sizes.extend_from_slice(&sizes.samples);
     } else {
         target_sizes.extend(std::iter::repeat_n(sizes.sample_size, count as usize));
+    }
+    if prepend_bytes > 0 {
+        let first = &mut target_sizes[sample_start as usize];
+        *first = first
+            .checked_add(prepend_bytes)
+            .ok_or_else(|| invalid("注入参数集后样本过大"))?;
     }
     let composition = &mut target_table.ctts.as_mut().unwrap().entries;
     match &source_table.ctts {
@@ -881,6 +1086,45 @@ mod tests {
     }
 
     #[test]
+    fn differing_descriptions_collapse_to_one() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let first = directory.path().join("1.mp4");
+        let second = directory.path().join("2.mp4");
+        let output = directory.path().join("merged.mp4");
+        fixture(&first)?;
+        fixture(&second)?;
+        let mut input = read_input(&second)?;
+        if let DynBox::Unknown((_, payload)) =
+            &mut input.moov.traks[0].mdia.minf.stbl.stsd.entries[0]
+        {
+            let mut bytes = payload.to_vec();
+            bytes[40] ^= 0xAA;
+            *payload = Bytes::from(bytes);
+        }
+        input.moov.traks[0].mdia.minf.stbl.stco.entries = vec![(input.ftyp.size() + 8) as u32];
+        let mut writer = File::create(&second)?;
+        input.ftyp.mux(&mut writer)?;
+        write_box(&mut writer, *b"mdat", &[1, 2, 3, 4, 5])?;
+        input.moov.mux(&mut writer)?;
+        drop(writer);
+
+        merge(&[first, second], &output, false)?;
+        let merged = read_input(&output)?;
+        assert_eq!(merged.moov.traks[0].mdia.minf.stbl.stsd.entries.len(), 1);
+        assert!(
+            merged.moov.traks[0]
+                .mdia
+                .minf
+                .stbl
+                .stsc
+                .entries
+                .iter()
+                .all(|entry| entry.sample_description_index == 1)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn different_timescales_are_rescaled() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
         let first = directory.path().join("1.mp4");
@@ -980,7 +1224,7 @@ mod tests {
         source.mdia.minf.stbl.stsz = Some(Stsz::new(4, Vec::new()));
         let mut target = source.clone();
         clear_track(&mut target);
-        append_track(&mut target, source, 20, &mut Vec::new(), &[32])?;
+        append_track(&mut target, source, 20, &mut Vec::new(), &[32], 0)?;
         assert_eq!(
             target.mdia.minf.stbl.stsz.as_ref().unwrap().samples,
             vec![4, 4]
@@ -1006,8 +1250,8 @@ mod tests {
         )));
         let mut target = source.clone();
         clear_track(&mut target);
-        append_track(&mut target, source, 20, &mut Vec::new(), &[32])?;
-        append_track(&mut target, source, 20, &mut vec![32], &[40])?;
+        append_track(&mut target, source, 20, &mut Vec::new(), &[32], 0)?;
+        append_track(&mut target, source, 20, &mut vec![32], &[40], 0)?;
         let DynBox::Unknown((_, payload)) = &target.mdia.minf.stbl.unknown[0] else {
             unreachable!()
         };
