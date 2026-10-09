@@ -588,15 +588,6 @@ fn append_track(
             target.mdia.mdhd.timescale, source.mdia.mdhd.timescale
         )));
     }
-    if target.tkhd.width != source.tkhd.width || target.tkhd.height != source.tkhd.height {
-        return Err(invalid(&format!(
-            "分辨率不一致: {}x{} vs {}x{}",
-            target.tkhd.width.to_num::<u32>(),
-            target.tkhd.height.to_num::<u32>(),
-            source.tkhd.width.to_num::<u32>(),
-            source.tkhd.height.to_num::<u32>()
-        )));
-    }
     let media_start = target.mdia.mdhd.duration;
     let source_table = &source.mdia.minf.stbl;
     let target_table = &mut target.mdia.minf.stbl;
