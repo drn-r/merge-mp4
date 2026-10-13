@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use bytes::Bytes;
 use scuffle_mp4::header::{BoxHeader, FullBoxHeader};
@@ -278,6 +279,69 @@ pub fn merge(files: &[PathBuf], output: &Path, overwrite: bool) -> Result<(), Bo
         destination.persist_noclobber(output)?;
     }
     Ok(())
+}
+
+pub fn merge_with_ffmpeg(
+    files: &[PathBuf],
+    output: &Path,
+    overwrite: bool,
+) -> Result<(), Box<dyn Error>> {
+    if files.is_empty() {
+        return Err("没有可合并的输入文件".into());
+    }
+    if output.exists() && !overwrite {
+        return Err(format!("输出文件已存在，不会覆盖: {}", output.display()).into());
+    }
+
+    let mut concat_list = tempfile::NamedTempFile::new()?;
+    for file in files {
+        let absolute_path = file.canonicalize()?;
+        let path = absolute_path
+            .to_str()
+            .ok_or_else(|| invalid("FFmpeg concat 不支持非 UTF-8 文件路径"))?;
+        writeln!(concat_list, "file '{}'", escape_concat_path(path)?)?;
+    }
+    concat_list.flush()?;
+
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let temporary_output = tempfile::Builder::new()
+        .suffix(".mp4")
+        .tempfile_in(parent)?;
+    let status = Command::new("ffmpeg")
+        .arg("-f")
+        .arg("concat")
+        .arg("-safe")
+        .arg("0")
+        .arg("-i")
+        .arg(concat_list.path())
+        .arg("-c")
+        .arg("copy")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg("-y")
+        .arg(temporary_output.path())
+        .status()
+        .map_err(|error| format!("无法启动 ffmpeg，请确认已安装且在 PATH 中: {error}"))?;
+    if !status.success() {
+        return Err(format!("ffmpeg 合并失败: {status}").into());
+    }
+
+    if overwrite {
+        temporary_output.persist(output)?;
+    } else {
+        temporary_output.persist_noclobber(output)?;
+    }
+    Ok(())
+}
+
+fn escape_concat_path(path: &str) -> io::Result<String> {
+    if path.contains(['\n', '\r']) {
+        return Err(invalid("文件路径包含 FFmpeg concat 清单不支持的换行符"));
+    }
+    Ok(path.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -1086,6 +1150,15 @@ mod tests {
         stts::{Stts, SttsEntry},
         tkhd::Tkhd,
     };
+
+    #[test]
+    fn concat_paths_escape_quotes_and_backslashes() {
+        assert_eq!(
+            escape_concat_path(r"/tmp/video's\part.mp4").unwrap(),
+            r"/tmp/video\'s\\part.mp4"
+        );
+        assert!(escape_concat_path("/tmp/video\npart.mp4").is_err());
+    }
 
     fn fixture(path: &Path) -> io::Result<()> {
         let ftyp = DynBox::Unknown((

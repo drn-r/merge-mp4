@@ -16,4 +16,8 @@ pub struct Cli {
     /// 仅输出排序后的预览，不执行合并
     #[arg(short = 's', long = "sort-only")]
     pub sort_only: bool,
+
+    /// 使用 FFmpeg concat demuxer 合并（需要安装 ffmpeg）
+    #[arg(long)]
+    pub ffmpeg: bool,
 }
