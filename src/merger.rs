@@ -297,12 +297,16 @@ pub fn merge_with_conversion(
     files: &[PathBuf],
     output: &Path,
     overwrite: bool,
+    core_count: Option<usize>,
 ) -> Result<(), Box<dyn Error>> {
     if files.is_empty() {
         return Err("没有可合并的输入文件".into());
     }
     if output.exists() && !overwrite {
         return Err(format!("输出文件已存在，不会覆盖: {}", output.display()).into());
+    }
+    if core_count == Some(0) {
+        return Err("--core 必须是大于 0 的整数".into());
     }
 
     let media_info = files
@@ -318,11 +322,11 @@ pub fn merge_with_conversion(
         .enumerate()
         .map(|(index, _)| converted_dir.path().join(format!("{index:08}.mp4")))
         .collect::<Vec<_>>();
-    let worker_count = thread::available_parallelism()
+    let default_worker_count = thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
-        .min(files.len())
         .min(4);
+    let worker_count = core_count.unwrap_or(default_worker_count).min(files.len());
     println!("使用 {worker_count} 个 FFmpeg 进程并行转码为 H.264/AAC...");
 
     let next_file = AtomicUsize::new(0);

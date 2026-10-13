@@ -2,6 +2,16 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+fn parse_positive_core(value: &str) -> Result<usize, String> {
+    let cores = value
+        .parse::<usize>()
+        .map_err(|_| "--core 必须是大于 0 的整数".to_owned())?;
+    if cores == 0 {
+        return Err("--core 必须是大于 0 的整数".to_owned());
+    }
+    Ok(cores)
+}
+
 /// 扫描目录中的 mp4 文件，按自然顺序排序后拼接为单个视频文件。
 #[derive(Parser)]
 #[command(name = "merge-mp4", version, about)]
@@ -24,4 +34,22 @@ pub struct Cli {
     /// 先并行转码为 H.264/AAC，再使用 FFmpeg 合并
     #[arg(long, conflicts_with = "ffmpeg")]
     pub convert: bool,
+
+    /// 转码时并行运行的 FFmpeg 进程数（默认最多 4）
+    #[arg(long, requires = "convert", value_name = "N", value_parser = parse_positive_core)]
+    pub core: Option<usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn core_count_requires_convert_and_must_be_positive() {
+        assert!(Cli::try_parse_from(["merge-mp4", "videos", "--core", "8"]).is_err());
+        assert!(Cli::try_parse_from(["merge-mp4", "videos", "--convert", "--core", "0"]).is_err());
+        let cli = Cli::try_parse_from(["merge-mp4", "videos", "--convert", "--core", "8"]).unwrap();
+        assert_eq!(cli.core, Some(8));
+    }
 }

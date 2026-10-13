@@ -63,7 +63,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     }
 
     if cli.convert {
-        merge_with_conversion(&files, &output, overwrite)?;
+        merge_with_conversion(&files, &output, overwrite, cli.core)?;
     } else if cli.ffmpeg {
         merge_with_ffmpeg(&files, &output, overwrite)?;
     } else {
