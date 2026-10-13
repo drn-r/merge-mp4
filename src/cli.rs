@@ -60,6 +60,16 @@ fn parse_positive_core(value: &str) -> Result<usize, String> {
     Ok(cores)
 }
 
+fn parse_positive_split(value: &str) -> Result<usize, String> {
+    let parts = value
+        .parse::<usize>()
+        .map_err(|_| "--split 必须是大于 0 的整数".to_owned())?;
+    if parts == 0 {
+        return Err("--split 必须是大于 0 的整数".to_owned());
+    }
+    Ok(parts)
+}
+
 /// 扫描目录中的 mp4 文件，按自然顺序排序后拼接为单个视频文件。
 #[derive(Parser)]
 #[command(name = "merge-mp4", version, about)]
@@ -95,6 +105,14 @@ pub struct Cli {
         default_value = "source"
     )]
     pub resolution: Resolution,
+
+    /// 将文件平均分成若干组，分别合并输出（文件名追加 _1、_2 ……）
+    #[arg(long, value_name = "N", value_parser = parse_positive_split)]
+    pub split: Option<usize>,
+
+    /// 静默模式：跳过所有确认，已存在的输出文件直接覆盖
+    #[arg(short = 'y', long = "yes")]
+    pub yes: bool,
 }
 
 #[cfg(test)]
@@ -120,5 +138,12 @@ mod tests {
                 .unwrap();
         assert_eq!(cli.resolution, Resolution::P1080);
         assert_eq!(cli.resolution.target_height(), Some(1080));
+    }
+
+    #[test]
+    fn split_must_be_positive() {
+        assert!(Cli::try_parse_from(["merge-mp4", "videos", "--split", "0"]).is_err());
+        let cli = Cli::try_parse_from(["merge-mp4", "videos", "--split", "4"]).unwrap();
+        assert_eq!(cli.split, Some(4));
     }
 }
