@@ -28,7 +28,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     let output = cli
         .output
         .clone()
-        .unwrap_or_else(|| cli.directory.join("output").join("merged.mp4"));
+        .unwrap_or_else(|| cli.directory.join("output").join(default_file_name(&cli)));
 
     let files = scan_mp4_files(&cli.directory, &output)?;
     if files.is_empty() {
@@ -77,6 +77,27 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     }
     println!("\n完成！已输出: {}", output.display());
     Ok(())
+}
+
+fn default_file_name(cli: &Cli) -> String {
+    let mut name = cli
+        .directory
+        .canonicalize()
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "merged".to_owned());
+    if cli.convert {
+        name.push_str("_converted");
+        if let Some(label) = cli.resolution.label() {
+            name.push('_');
+            name.push_str(label);
+        }
+    }
+    name.push_str(".mp4");
+    name
 }
 
 fn print_preview(files: &[PathBuf], output: &Path) {

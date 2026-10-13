@@ -36,6 +36,18 @@ impl Resolution {
             Resolution::P360 => Some(360),
         }
     }
+
+    /// 用于输出文件名的分辨率标签；`Source` 不追加标签。
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            Resolution::Source => None,
+            Resolution::P2160 => Some("2160p"),
+            Resolution::P1080 => Some("1080p"),
+            Resolution::P720 => Some("720p"),
+            Resolution::P480 => Some("480p"),
+            Resolution::P360 => Some("360p"),
+        }
+    }
 }
 
 fn parse_positive_core(value: &str) -> Result<usize, String> {
@@ -55,7 +67,7 @@ pub struct Cli {
     /// 包含 mp4 文件的目录（必填）
     pub directory: PathBuf,
 
-    /// 输出文件路径（默认在源目录的 output 子目录生成 merged.mp4）
+    /// 输出文件路径（默认在源目录的 output 子目录生成 以目录名命名的 mp4）
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
 
