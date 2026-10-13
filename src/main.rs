@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 
 use cli::Cli;
-use merger::{merge, merge_with_ffmpeg};
+use merger::{merge, merge_with_conversion, merge_with_ffmpeg};
 use scanner::{file_name, scan_mp4_files};
 
 fn main() {
@@ -62,7 +62,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         std::fs::create_dir_all(cli.directory.join("output"))?;
     }
 
-    if cli.ffmpeg {
+    if cli.convert {
+        merge_with_conversion(&files, &output, overwrite)?;
+    } else if cli.ffmpeg {
         merge_with_ffmpeg(&files, &output, overwrite)?;
     } else {
         merge(&files, &output, overwrite)?;

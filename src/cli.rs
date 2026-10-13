@@ -20,4 +20,8 @@ pub struct Cli {
     /// 使用 FFmpeg concat demuxer 合并（需要安装 ffmpeg）
     #[arg(long)]
     pub ffmpeg: bool,
+
+    /// 先并行转码为 H.264/AAC，再使用 FFmpeg 合并
+    #[arg(long, conflicts_with = "ffmpeg")]
+    pub convert: bool,
 }

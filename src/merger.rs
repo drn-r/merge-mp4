@@ -1,9 +1,13 @@
 use std::error::Error;
 use std::fs::File;
-use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use scuffle_mp4::header::{BoxHeader, FullBoxHeader};
@@ -286,6 +290,14 @@ pub fn merge_with_ffmpeg(
     output: &Path,
     overwrite: bool,
 ) -> Result<(), Box<dyn Error>> {
+    run_concat_ffmpeg(files, output, overwrite)
+}
+
+pub fn merge_with_conversion(
+    files: &[PathBuf],
+    output: &Path,
+    overwrite: bool,
+) -> Result<(), Box<dyn Error>> {
     if files.is_empty() {
         return Err("没有可合并的输入文件".into());
     }
@@ -293,6 +305,303 @@ pub fn merge_with_ffmpeg(
         return Err(format!("输出文件已存在，不会覆盖: {}", output.display()).into());
     }
 
+    let media_info = files
+        .iter()
+        .map(|file| probe_media(file))
+        .collect::<io::Result<Vec<_>>>()?;
+    let total_duration: f64 = media_info.iter().map(|info| info.duration).sum();
+    let target_width = media_info[0].width / 2 * 2;
+    let target_height = media_info[0].height / 2 * 2;
+    let converted_dir = tempfile::tempdir()?;
+    let converted_files = files
+        .iter()
+        .enumerate()
+        .map(|(index, _)| converted_dir.path().join(format!("{index:08}.mp4")))
+        .collect::<Vec<_>>();
+    let worker_count = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(files.len())
+        .min(4);
+    println!("使用 {worker_count} 个 FFmpeg 进程并行转码为 H.264/AAC...");
+
+    let next_file = AtomicUsize::new(0);
+    let cancelled = AtomicBool::new(false);
+    let (progress_tx, progress_rx) = mpsc::channel();
+    let conversion_result = thread::scope(|scope| {
+        let next_file_ref = &next_file;
+        let cancelled_ref = &cancelled;
+        let files_ref = files;
+        let converted_files_ref = &converted_files;
+        let media_info_ref = &media_info;
+        for _ in 0..worker_count {
+            let next_file = next_file_ref;
+            let cancelled = cancelled_ref;
+            let files = files_ref;
+            let converted_files = converted_files_ref;
+            let media_info = media_info_ref;
+            let progress_tx = progress_tx.clone();
+            scope.spawn(move || {
+                loop {
+                    if cancelled.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let index = next_file.fetch_add(1, Ordering::Relaxed);
+                    if index >= files.len() {
+                        break;
+                    }
+                    if let Err(error) = transcode_file(
+                        &files[index],
+                        &converted_files[index],
+                        media_info[index],
+                        target_width,
+                        target_height,
+                        index,
+                        &progress_tx,
+                    ) {
+                        cancelled.store(true, Ordering::Relaxed);
+                        let _ = progress_tx.send(ConversionMessage::Failed(format!(
+                            "{} 转码失败: {error}",
+                            files[index].display()
+                        )));
+                    }
+                }
+            });
+        }
+        drop(progress_tx);
+
+        let mut progress = vec![0.0; files.len()];
+        let mut failure = None;
+        let started = Instant::now();
+        let mut last_update = Instant::now();
+        while let Ok(message) = progress_rx.recv() {
+            match message {
+                ConversionMessage::Progress { index, seconds } => {
+                    progress[index] = seconds.min(media_info[index].duration);
+                    let completed_duration: f64 = progress.iter().sum();
+                    let fraction = (completed_duration / total_duration).clamp(0.0, 1.0);
+                    if last_update.elapsed() >= Duration::from_millis(500) || fraction >= 1.0 {
+                        let eta = if fraction > 0.0 && fraction < 1.0 {
+                            let elapsed = started.elapsed().as_secs_f64();
+                            format_eta(elapsed * (1.0 - fraction) / fraction)
+                        } else {
+                            "计算中".to_owned()
+                        };
+                        print!("\r转码进度: {:5.1}%，预计剩余 {eta}   ", fraction * 100.0);
+                        let _ = io::stdout().flush();
+                        last_update = Instant::now();
+                    }
+                }
+                ConversionMessage::Failed(error) => {
+                    failure = Some(error);
+                }
+            }
+        }
+        if let Some(error) = failure {
+            eprintln!();
+            Err(error)
+        } else {
+            println!("\r转码进度: 100.0%，预计剩余 0 秒          ");
+            Ok(())
+        }
+    });
+    conversion_result?;
+
+    println!("正在无损合并转码后的文件...");
+    run_concat_ffmpeg(&converted_files, output, overwrite)
+}
+
+#[derive(Clone, Copy)]
+struct MediaInfo {
+    duration: f64,
+    has_audio: bool,
+    width: u32,
+    height: u32,
+}
+
+enum ConversionMessage {
+    Progress { index: usize, seconds: f64 },
+    Failed(String),
+}
+
+fn probe_media(path: &Path) -> io::Result<MediaInfo> {
+    let result = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration:stream=codec_type,width,height",
+            "-of",
+            "default=noprint_wrappers=1",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|error| {
+            invalid(&format!(
+                "无法启动 ffprobe，请确认已安装且在 PATH 中: {error}"
+            ))
+        })?;
+    if !result.status.success() {
+        return Err(invalid(&format!(
+            "ffprobe 无法读取 {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&result.stderr).trim()
+        )));
+    }
+
+    let mut duration = None;
+    let mut has_video = false;
+    let mut has_audio = false;
+    let mut width = None;
+    let mut height = None;
+    for line in String::from_utf8_lossy(&result.stdout).lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            match key {
+                "duration" => duration = value.parse::<f64>().ok(),
+                "codec_type" if value == "video" => has_video = true,
+                "codec_type" if value == "audio" => has_audio = true,
+                "width" => width = value.parse::<u32>().ok(),
+                "height" => height = value.parse::<u32>().ok(),
+                _ => {}
+            }
+        }
+    }
+    let duration = duration
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
+        .ok_or_else(|| invalid(&format!("{} 的视频时长无效", path.display())))?;
+    if !has_video {
+        return Err(invalid(&format!("{} 不包含视频轨道", path.display())));
+    }
+    let width = width
+        .filter(|width| *width >= 2)
+        .ok_or_else(|| invalid(&format!("{} 的视频宽度无效", path.display())))?;
+    let height = height
+        .filter(|height| *height >= 2)
+        .ok_or_else(|| invalid(&format!("{} 的视频高度无效", path.display())))?;
+    Ok(MediaInfo {
+        duration,
+        has_audio,
+        width,
+        height,
+    })
+}
+
+fn transcode_file(
+    input: &Path,
+    output: &Path,
+    media: MediaInfo,
+    target_width: u32,
+    target_height: u32,
+    index: usize,
+    progress_tx: &mpsc::Sender<ConversionMessage>,
+) -> io::Result<()> {
+    let mut command = Command::new("ffmpeg");
+    command
+        .args(["-hide_banner", "-loglevel", "error", "-nostats", "-y"])
+        .arg("-threads")
+        .arg("1")
+        .arg("-i")
+        .arg(input);
+    if !media.has_audio {
+        command
+            .args(["-f", "lavfi", "-i"])
+            .arg("anullsrc=channel_layout=stereo:sample_rate=48000");
+    }
+    command
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-map")
+        .arg(if media.has_audio { "0:a:0" } else { "1:a:0" })
+        .args([
+            "-c:v",
+            "libx264",
+            "-vf",
+        ])
+        .arg(format!(
+            "scale={target_width}:{target_height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p"
+        ))
+        .args([
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-threads:v",
+            "1",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ac",
+            "2",
+            "-ar",
+            "48000",
+            "-af",
+            "apad",
+            "-t",
+        ])
+        .arg(media.duration.to_string())
+        .args(["-progress", "pipe:1", "-stats_period", "0.5"])
+        .arg(output)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+
+    let mut child = command.spawn().map_err(|error| {
+        invalid(&format!(
+            "无法启动 ffmpeg，请确认已安装且在 PATH 中: {error}"
+        ))
+    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| invalid("无法读取 ffmpeg 转码进度"))?;
+    for line in BufReader::new(stdout).lines() {
+        let line = line?;
+        if let Some(value) = line
+            .strip_prefix("out_time_us=")
+            .or_else(|| line.strip_prefix("out_time_ms="))
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            let _ = progress_tx.send(ConversionMessage::Progress {
+                index,
+                seconds: value as f64 / 1_000_000.0,
+            });
+        } else if line == "progress=end" {
+            let _ = progress_tx.send(ConversionMessage::Progress {
+                index,
+                seconds: media.duration,
+            });
+        }
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(invalid(&format!("ffmpeg 退出状态: {status}")));
+    }
+    Ok(())
+}
+
+fn format_eta(seconds: f64) -> String {
+    let seconds = seconds.ceil() as u64;
+    let hours = seconds / 3600;
+    let minutes = seconds % 3600 / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+fn run_concat_ffmpeg(
+    files: &[PathBuf],
+    output: &Path,
+    overwrite: bool,
+) -> Result<(), Box<dyn Error>> {
+    if files.is_empty() {
+        return Err("没有可合并的输入文件".into());
+    }
+    if output.exists() && !overwrite {
+        return Err(format!("输出文件已存在，不会覆盖: {}", output.display()).into());
+    }
     let mut concat_list = tempfile::NamedTempFile::new()?;
     for file in files {
         let absolute_path = file.canonicalize()?;
