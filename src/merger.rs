@@ -608,11 +608,8 @@ fn run_concat_ffmpeg(
     }
     let mut concat_list = tempfile::NamedTempFile::new()?;
     for file in files {
-        let absolute_path = file.canonicalize()?;
-        let path = absolute_path
-            .to_str()
-            .ok_or_else(|| invalid("FFmpeg concat 不支持非 UTF-8 文件路径"))?;
-        writeln!(concat_list, "file '{}'", escape_concat_path(path)?)?;
+        let path = concat_input_path(file)?;
+        writeln!(concat_list, "file '{}'", escape_concat_path(&path)?)?;
     }
     concat_list.flush()?;
 
@@ -650,11 +647,28 @@ fn run_concat_ffmpeg(
     Ok(())
 }
 
+// canonicalize 在 Windows 上返回 \\?\ 扩展长度前缀，FFmpeg 无法打开，需剥离。
+fn concat_input_path(file: &Path) -> io::Result<String> {
+    let absolute = file.canonicalize()?;
+    let path = absolute
+        .to_str()
+        .ok_or_else(|| invalid("FFmpeg concat 不支持非 UTF-8 文件路径"))?;
+    let path = if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(local) = path.strip_prefix(r"\\?\") {
+        local.to_owned()
+    } else {
+        path.to_owned()
+    };
+    Ok(path)
+}
+
+// concat 清单路径用单引号包裹；单引号内反斜杠为字面量，只需转义单引号本身。
 fn escape_concat_path(path: &str) -> io::Result<String> {
     if path.contains(['\n', '\r']) {
         return Err(invalid("文件路径包含 FFmpeg concat 清单不支持的换行符"));
     }
-    Ok(path.replace('\\', "\\\\").replace('\'', "\\'"))
+    Ok(path.replace('\'', "'\\''"))
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -1465,10 +1479,10 @@ mod tests {
     };
 
     #[test]
-    fn concat_paths_escape_quotes_and_backslashes() {
+    fn concat_paths_escape_quotes_and_keep_backslashes() {
         assert_eq!(
             escape_concat_path(r"/tmp/video's\part.mp4").unwrap(),
-            r"/tmp/video\'s\\part.mp4"
+            r"/tmp/video'\''s\part.mp4"
         );
         assert!(escape_concat_path("/tmp/video\npart.mp4").is_err());
     }
