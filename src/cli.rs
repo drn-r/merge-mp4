@@ -1,6 +1,42 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+/// 转码后的目标分辨率（按高度缩放并保持宽高比）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Resolution {
+    /// 保持源分辨率（默认）
+    Source,
+    /// 2160p（4K）
+    #[value(name = "2160p", alias = "4k")]
+    P2160,
+    /// 1080p
+    #[value(name = "1080p")]
+    P1080,
+    /// 720p
+    #[value(name = "720p")]
+    P720,
+    /// 480p
+    #[value(name = "480p")]
+    P480,
+    /// 360p
+    #[value(name = "360p")]
+    P360,
+}
+
+impl Resolution {
+    /// 返回目标高度；`Source` 表示沿用源分辨率。
+    pub fn target_height(self) -> Option<u32> {
+        match self {
+            Resolution::Source => None,
+            Resolution::P2160 => Some(2160),
+            Resolution::P1080 => Some(1080),
+            Resolution::P720 => Some(720),
+            Resolution::P480 => Some(480),
+            Resolution::P360 => Some(360),
+        }
+    }
+}
 
 fn parse_positive_core(value: &str) -> Result<usize, String> {
     let cores = value
@@ -38,11 +74,20 @@ pub struct Cli {
     /// 转码时并行运行的 FFmpeg 进程数（默认最多 4）
     #[arg(long, requires = "convert", value_name = "N", value_parser = parse_positive_core)]
     pub core: Option<usize>,
+
+    /// 转码后的目标分辨率（按高度缩放并保持宽高比；默认保持源分辨率）
+    #[arg(
+        long,
+        requires = "convert",
+        value_name = "RES",
+        default_value = "source"
+    )]
+    pub resolution: Resolution,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Cli;
+    use super::{Cli, Resolution};
     use clap::Parser;
 
     #[test]
@@ -51,5 +96,17 @@ mod tests {
         assert!(Cli::try_parse_from(["merge-mp4", "videos", "--convert", "--core", "0"]).is_err());
         let cli = Cli::try_parse_from(["merge-mp4", "videos", "--convert", "--core", "8"]).unwrap();
         assert_eq!(cli.core, Some(8));
+    }
+
+    #[test]
+    fn resolution_requires_convert_and_defaults_to_source() {
+        assert!(Cli::try_parse_from(["merge-mp4", "videos", "--resolution", "720p"]).is_err());
+        let cli = Cli::try_parse_from(["merge-mp4", "videos", "--convert"]).unwrap();
+        assert_eq!(cli.resolution, Resolution::Source);
+        let cli =
+            Cli::try_parse_from(["merge-mp4", "videos", "--convert", "--resolution", "1080p"])
+                .unwrap();
+        assert_eq!(cli.resolution, Resolution::P1080);
+        assert_eq!(cli.resolution.target_height(), Some(1080));
     }
 }

@@ -298,6 +298,7 @@ pub fn merge_with_conversion(
     output: &Path,
     overwrite: bool,
     core_count: Option<usize>,
+    target_height: Option<u32>,
 ) -> Result<(), Box<dyn Error>> {
     if files.is_empty() {
         return Err("没有可合并的输入文件".into());
@@ -314,8 +315,17 @@ pub fn merge_with_conversion(
         .map(|file| probe_media(file))
         .collect::<io::Result<Vec<_>>>()?;
     let total_duration: f64 = media_info.iter().map(|info| info.duration).sum();
-    let target_width = media_info[0].width / 2 * 2;
-    let target_height = media_info[0].height / 2 * 2;
+    let source_width = media_info[0].width;
+    let source_height = media_info[0].height;
+    let (target_width, target_height) = match target_height {
+        // 按目标高度缩放，宽度按源宽高比推导，避免黑边。
+        Some(height) => {
+            let width =
+                (u64::from(source_width) * u64::from(height) / u64::from(source_height)) as u32;
+            (width / 2 * 2, height / 2 * 2)
+        }
+        None => (source_width / 2 * 2, source_height / 2 * 2),
+    };
     let converted_dir = tempfile::tempdir()?;
     let converted_files = files
         .iter()
